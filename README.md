@@ -1,130 +1,91 @@
-# fleet-template-v1
+# Vault template
 
-## What This Template Is
+Provisioned from [`Qode-Fleet-Control/fleet-template-v1`](https://github.com/Qode-Fleet-Control/fleet-template-v1) — the fleet
+lifecycle contract (`bin/`, `fleet.conf`, `compose.yaml`, deploy workflows) with a [Vault](https://developer.hashicorp.com/vault) server configuration and ACL policies
+laid on top.
 
-`fleet-template-v1` is a **language-agnostic app lifecycle harness** for apps
-managed by the fleet platform. It gives any app — Node, Python, Go, a Docker
-Compose stack, anything — a uniform way to be deployed and controlled, without
-the fleet needing to know a single thing about your stack.
+**This repo is a job, not a service.** Its container checks the configuration and the
+policies against real Vault servers it starts and stops itself (127.0.0.1 inside the
+container), then exits — 0 when all of it passes. Nothing is published and nothing
+listens on `$PORT`.
 
-The fleet injects runtime variables into the environment (`PORT`, `BASE_PATH`,
-`DATABASE_URL`) and calls `./bin/run` to deploy. Everything project-specific —
-how to install, build, and start your app — lives in **one file: `fleet.conf`**.
-That is the only file you edit per project.
+## What is in it
 
-## Repository Structure
+| file | |
+|---|---|
+| `config/vault.hcl` | server config: integrated (raft) storage, TCP listener, UI, api/cluster addresses, lease TTLs |
+| `policies/app.hcl` | an application: read its own KV v2 secrets under `secret/app/`, renew/look up its token |
+| `policies/ci.hcl` | the deploy pipeline: manage `secret/app/` (incl. delete/undelete), nothing else |
+| `policies/admin.hcl` | operators: mounts, auth methods, ACL policies, all of `secret/` — not seal/rekey/raft |
+| `scripts/check.sh` | the job (below) |
 
-```
-fleet.conf        ← the only file you edit per project
-.env              ← local-only env vars (gitignored)
-bin/
-  _common.sh      ← shared logic; never edit this
-  run             ← install + build + start (called by the fleet)
-  start           ← start only (no rebuild)
-  restart         ← stop + full run
-  reload          ← hot-reload config without rebuild
-  stop            ← stop the running process
-```
+What `scripts/check.sh` does:
 
-## The One File You Edit: `fleet.conf`
+1. every policy is canonically formatted (`vault policy fmt` on a copy, then `diff`);
+2. `vault operator diagnose -config=config/vault.hcl` reports no failure (warnings, such as
+   TLS being disabled, are allowed), and a real `vault server -config=config/vault.hcl`
+   boots and answers `vault status` as sealed and uninitialised;
+3. a dev-mode server accepts `vault policy write` for every policy, and tokens holding each
+   policy get exactly the capabilities promised (e.g. `app` can read
+   `secret/data/app/config` but is denied `secret/data/other/x`; `admin` is denied
+   `sys/seal`); an `app` token then reads a real secret.
 
-`fleet.conf` is sourced as shell by the lifecycle scripts. Fill in the commands
-for your stack; leave any command empty (`''`) to skip that step.
+## Run it
 
-```sh
-NAME="my-app"           # label shown in fleet logs
-PORT="3000"             # default port (fleet overrides via $PORT env var)
-HEALTH_PATH="/"         # HTTP path that returns 200 when the app is ready
+**On the fleet:** `bin/run` builds the image (`docker compose build`) and stops there —
+`DOCKER_START_CMD` is empty because there is no server. Run the job with
+`docker compose run --rm app`.
 
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/server.js'   # must listen on $PORT; run in foreground
-RELOAD_CMD=''           # optional; empty → falls back to stop+start
-```
+**With docker:**
 
-> **Critical rule:** single-quote any command that uses `$PORT` or
-> `$BASE_PATH`. Single quotes defer variable expansion to **runtime** — when the
-> command actually runs, with the fleet-injected value — rather than at the
-> moment `fleet.conf` is sourced (when those values aren't set yet). Use
-> `START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'`, never double quotes.
+    docker compose build
+    docker compose run --rm app        # exit 0 = "vault: config and policies valid"
 
-## How the Lifecycle Works
+**Without docker** (needs `vault` on `PATH`, `/vault/data` writable and 127.0.0.1 ports
+8200, 8201 and 8210 free):
 
-| Script | What it does | When to use |
-| --- | --- | --- |
-| `bin/run` | `INSTALL_CMD` → `BUILD_CMD` → `START_CMD` | Fleet deploy, fresh start |
-| `bin/start` | `START_CMD` only | Restart without rebuild |
-| `bin/restart` | stop + `bin/run` | After a code/dep change |
-| `bin/reload` | `RELOAD_CMD`, or stop+start if empty | After a config-only change |
-| `bin/stop` | Kill by pidfile or port | Tear down |
+    sh scripts/check.sh
 
-> The process PID is written to `.fleet/app.pid` so subsequent `stop`/`restart`
-> calls can find and terminate it reliably. If the pidfile is missing or stale,
-> `stop` falls back to freeing whatever is listening on `$PORT`.
+To run the server for real: `vault server -config=config/vault.hcl`, then
+`vault operator init` and unseal; load policies with `vault policy write app policies/app.hcl`.
 
-## How to Apply This to Your Project
+## Origin
 
-### Step 1 — Copy the template into your repo
+    hand-written — Vault ships no project generator
 
-```sh
-cp -r fleet-template-v1/* my-project/
-```
+Config follows the server configuration reference (raft storage + tcp listener); policies
+follow the policy docs (one file per policy, path + capabilities).
 
-Or, if starting fresh, just clone it and work from `main`.
+## Deviations, and why
 
-### Step 2 — Edit `fleet.conf` (the only required change)
+- `Dockerfile` is a job image on `hashicorp/vault:2.1.1`: its `ENTRYPOINT` (which starts a
+  server) is cleared and the default command is `scripts/check.sh`. Runs as the image's own
+  non-root `vault` user; `/vault/data` is created for it (mode 700). `SKIP_SETCAP=1`: the
+  config sets `disable_mlock`, so no `IPC_LOCK` capability is needed.
+- `tls_disable = true` on the listener and `127.0.0.1` api/cluster addresses keep the config
+  runnable on a laptop and in CI; the comments mark what to change for production (TLS,
+  reachable addresses, `retry_join`, auto-unseal).
+- No `telemetry` stanza: with a Prometheus-only stanza (`prometheus_retention_time`,
+  `disable_hostname`) Vault 2.1's `operator diagnose` reports a *failure* ("incomplete
+  Stackdriver telemetry configuration"), which would fail the job. Add yours once you know
+  the sink, and keep the job green.
 
-Fill in your stack's commands. Per-stack examples:
+## Verified
 
-```sh
-# Node.js
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/index.js'
+**The docker job has NOT been verified yet.** On 2026-10-05 the build host's docker disk
+stayed below the 6 GB floor (0-3 GB free) for over three hours, so `docker compose build`
+was never run for this repo. Build and run it once before trusting it:
 
-# Python (Gunicorn)
-INSTALL_CMD='pip install -r requirements.txt'
-BUILD_CMD=''
-START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'
+    docker compose build && docker compose run --rm app; docker compose down --rmi local -v
 
-# Go
-INSTALL_CMD=''
-BUILD_CMD='go build -o ./out/server ./cmd/server'
-START_CMD='./out/server'
+What WAS checked, with the real CLIs outside docker (same `scripts/check.sh` the image runs):
 
-# Docker Compose
-INSTALL_CMD=''
-BUILD_CMD='docker compose build'
-START_CMD='docker compose up'
-RELOAD_CMD='docker compose up -d --no-build'
-```
+    vault 2.1.1: sh scripts/check.sh        # on a copy with ports/data path shifted for the host:
+                                            # policy fmt ok, diagnose (warnings only), config server sealed (exit 2),
+                                            # 3 policies written, 6 capability checks ok, app token read its secret -> exit 0
 
-### Step 3 — Set local env vars in `.env` (gitignored)
+## Serving over HTTP
 
-```sh
-APP_NAME=My App
-DATABASE_URL=postgres://localhost/mydb
-```
-
-### Step 4 — Verify standalone
-
-```sh
-PORT=3001 bin/run      # should install, build, and serve on 3001
-curl http://localhost:3001/   # should 200
-```
-
-### Step 5 — Connect to the fleet
-
-Point the fleet at your repo. It will clone it, inject `PORT` / `BASE_PATH` /
-`DATABASE_URL`, and call `bin/run`. As long as your `START_CMD` listens on
-`$PORT` and `HEALTH_PATH` returns 200, the fleet will mark the app healthy.
-
-## Key Invariants
-
-- **`START_CMD` must run in the foreground and listen on `$PORT`.** Do not use a
-  dev server — HMR / hot-reload chunks 404 behind the ingress and will break the
-  app.
-- **Never put secrets in `fleet.conf`** — it's committed. Use `.env` locally;
-  the fleet injects secrets via the environment.
-- **`bin/_common.sh` is shared infrastructure** — don't edit it per project. All
-  project-specific configuration belongs in `fleet.conf`.
+There is no HTTP surface. If you add one, listen on `0.0.0.0:$PORT`, serve at `/`, set
+`PORT`, `HEALTH_PATH`, `START_CMD` and `DOCKER_START_CMD` in `fleet.conf`, and publish
+`"${PORT}:${PORT}"` in `compose.yaml`. See `docs/fleet-lifecycle.md`.
