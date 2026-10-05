@@ -1,3 +1,13 @@
-.env
 .fleet/
+*.log
 .fleet-deploy.log
+
+# --- Vault ---
+# local raft data / file storage
+data/
+# unseal keys, root tokens and TLS material never belong in git
+*.pem
+*.key
+*.token
+root-token*
+init*.json
